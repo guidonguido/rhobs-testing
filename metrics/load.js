@@ -13,17 +13,18 @@ const STAGE_DURATION_SECONDS = duration_seconds(STAGE_DURATION);
 const FINAL_STAGE_DURATION_SECONDS = duration_seconds(FINAL_STAGE_DURATION);
 
 // Time between stages when the next stage is gated by a check for load shedding.
-const STAGE_GATE_DELAY_SECONDS = Math.max( 1, Number(__ENV.STAGE_GATE_DELAY_SECONDS || 5));
+const STAGE_GATE_DELAY_SECONDS = Math.max(10, Number(__ENV.STAGE_GATE_DELAY_SECONDS || 120));
 const SHEDDING_CHECK_INTERVAL = __ENV.SHEDDING_CHECK_INTERVAL || "5s";
+const AGENT_MAX_LAG_SECONDS = Math.max(0, Number(__ENV.AGENT_MAX_LAG_SECONDS || 5));
 
-// Remote Write payload size limit.
-const BACKEND_REQUEST_SIZE_LIMIT_BYTES = 10 * 1024 * 1024;
-const BACKEND_SAMPLES_PER_REQUEST_LIMIT = 2500;
+// Remote Write payload size.
 const SAMPLES_PER_BATCH = Math.max(1, Number(__ENV.SAMPLES_PER_BATCH || 2000));
 const SERIES_BATCHES = Math.max(1, Number(__ENV.SERIES_BATCHES || 10));
-if (SAMPLES_PER_BATCH > BACKEND_SAMPLES_PER_REQUEST_LIMIT) {
+// 2500 samples is a conservative limit to avoid exceeding the Prometheus Agent's default 10MB request size limit.
+// In addition, the Prometheus Agent defaults to max_samples_per_send: 2000 
+if (SAMPLES_PER_BATCH > 2500) {
   throw new Error(
-    `SAMPLES_PER_BATCH must not exceed ${BACKEND_SAMPLES_PER_REQUEST_LIMIT}`,
+    `SAMPLES_PER_BATCH must not exceed 2500`,
   );
 }
 
@@ -146,7 +147,7 @@ scenarios.router_restart = {
 
 export const options = {
   setupTimeout: "1m",
-  teardownTimeout: "10m",
+  teardownTimeout: "1m",
   scenarios: scenarios,
 };
 
@@ -156,9 +157,7 @@ export function setup() {
 
   console.log(
     `run_id=${RUN_ID} event=setup utc=${new Date().toISOString()} ` +
-      `router_replicas=${DEPLOYMENT.spec.replicas} samples_per_batch=${SAMPLES_PER_BATCH} ` +
-      `backend_samples_limit=${BACKEND_SAMPLES_PER_REQUEST_LIMIT} ` +
-      `backend_size_limit_bytes=${BACKEND_REQUEST_SIZE_LIMIT_BYTES}`,
+      `router_replicas=${DEPLOYMENT.spec.replicas} samples_per_batch=${SAMPLES_PER_BATCH} `,
   );
 
   return {
@@ -229,6 +228,12 @@ export function send_batch() {
     "Prometheus Agent accepted batch": (response) =>
       response.status >= 200 && response.status < 300,
   });
+  if (RESPONSE.status < 200 || RESPONSE.status >= 300) {
+    const MESSAGE = `run_id=${RUN_ID} event=send_batch_failed utc=${new Date().toISOString()} ` +
+        `status=${RESPONSE.status} body=${RESPONSE.body}`;
+    exec.test.abort(MESSAGE);
+    throw new Error(MESSAGE);
+  }
 }
 
 export function monitor_shedding(data) {
@@ -237,11 +242,32 @@ export function monitor_shedding(data) {
 }
 
 export function gate_next_stage(data) {
-  abort_if_shedding(data.agent_counters, exec.scenario.name);
-  console.log(
-    `run_id=${RUN_ID} event=stage-gate-passed utc=${new Date().toISOString()} ` +
-      `next_stage=${exec.scenario.name.replace("gate_load_stage_", "")}`,
-  );
+  const DEADLINE = Date.now() + (STAGE_GATE_DELAY_SECONDS - 1) * 1000;
+  let current;
+
+  while (Date.now() < DEADLINE) {
+    abort_if_shedding(data.agent_counters, exec.scenario.name);
+    current = get_agent_counters();
+
+    if (
+      current.pending_samples === 0 &&
+      agent_lag_seconds(current) <= AGENT_MAX_LAG_SECONDS
+    ) {
+      console.log(
+        `run_id=${RUN_ID} event=stage-gate-passed utc=${new Date().toISOString()} ` +
+          `next_stage=${exec.scenario.name.replace("gate_load_stage_", "")}`,
+      );
+      return;
+    }
+
+    sleep(5);
+  }
+
+  const MESSAGE =
+    `agent did not drain: pending_samples=${current?.pending_samples || 0} ` +
+    `lag_seconds=${current ? agent_lag_seconds(current) : 0}`;
+  exec.test.abort(MESSAGE);
+  throw new Error(MESSAGE);
 }
 
 export function restart_routers(data) {
@@ -256,6 +282,19 @@ export function restart_routers(data) {
   console.log(
     `run_id=${RUN_ID} event=router-restart-end utc=${new Date().toISOString()} ` +
       `deployment=${ROUTER_DEPLOYMENT_NAME} replicas=${data.router_replicas}`,
+  );
+}
+
+export function teardown() {
+  const AGENT = get_agent_counters();
+  const ROUTER = get_router_deployment();
+  console.log(
+    `run_id=${RUN_ID} event=teardown utc=${new Date().toISOString()} ` +
+      `failed_samples=${AGENT.failed_samples} retried_samples=${AGENT.retried_samples} ` +
+      `pending_samples=${AGENT.pending_samples} agent_lag_seconds=${agent_lag_seconds(AGENT)} ` +
+      `router_replicas=${ROUTER.spec.replicas} updated_replicas=${ROUTER.status?.updatedReplicas || 0} ` +
+      `available_replicas=${ROUTER.status?.availableReplicas || 0} ` +
+      `unavailable_replicas=${ROUTER.status?.unavailableReplicas || 0}`,
   );
 }
 
@@ -285,8 +324,13 @@ function check_shedding(baseline) {
   );
 }
 
-// Get Prometheus Agent RW metrics for failed and retried samples.
+function agent_lag_seconds(counters) {
+  return Math.max(0, counters.highest_timestamp - counters.highest_sent_timestamp);
+}
+
+// Get Prometheus Agent RW metrics.
 function get_agent_counters() {
+  // Get with retries to avoid failures for unready Prometheus Agent.
   const RESPONSE = http.get(PROMETHEUS_METRICS_URL, { timeout: "2s" });
   if (RESPONSE.status !== 200) {
     const MESSAGE =
@@ -304,6 +348,18 @@ function get_agent_counters() {
     retried_samples: metric_sum(
       RESPONSE.body,
       "prometheus_remote_storage_samples_retried_total",
+    ),
+    pending_samples: metric_sum(
+      RESPONSE.body,
+      "prometheus_remote_storage_samples_pending",
+    ),
+    highest_timestamp: metric_sum(
+      RESPONSE.body,
+      "prometheus_remote_storage_queue_highest_timestamp_seconds",
+    ),
+    highest_sent_timestamp: metric_sum(
+      RESPONSE.body,
+      "prometheus_remote_storage_queue_highest_sent_timestamp_seconds",
     ),
   };
 }
