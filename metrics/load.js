@@ -32,10 +32,7 @@ if (SAMPLES_PER_BATCH > 2500) {
 
 const PROMETHEUS_RECEIVER_URL = required(__ENV.PROMETHEUS_RECEIVER_URL, "PROMETHEUS_RECEIVER_URL");
 const PROMETHEUS_METRICS_URL = required(__ENV.PROMETHEUS_METRICS_URL, "PROMETHEUS_METRICS_URL");
-const OBSERVATORIUM_METRICS_URL = required(
-  __ENV.OBSERVATORIUM_METRICS_URL,
-  "OBSERVATORIUM_METRICS_URL",
-);
+const META_MONITORING_PROMETHEUS_URL = required(__ENV.META_MONITORING_PROMETHEUS_URL, "META_MONITORING_PROMETHEUS_URL");
 const REMOTE_WRITE_NAME = __ENV.REMOTE_WRITE_NAME || "rhobs-load-test";
 const KUBE_API_SERVER_URL = required(__ENV.KUBE_API_SERVER_URL, "KUBE_API_SERVER_URL");
 const KUBE_NAMESPACE = required(__ENV.KUBE_NAMESPACE, "KUBE_NAMESPACE");
@@ -333,7 +330,7 @@ export function teardown(data) {
 function abort_if_shedding(baseline, source) {
 
   // Shedding is detected after 10 new rejected requests.
-  if (get_throttle_rejected_total() <= baseline + 10) {
+  if (get_throttle_rejected_total() <= baseline + 100) {
     return;
   }
 
@@ -345,30 +342,52 @@ function abort_if_shedding(baseline, source) {
 }
 
 function get_throttle_rejected_total() {
-  const RESPONSE = http.get(OBSERVATORIUM_METRICS_URL, { timeout: "2s" });
+  const SHEDDING_QUERY =
+  'sum(throttle_rejected_total{job="rhobs-gateway",handler="metrics"}) or vector(0)';
+  const RESPONSE = http.get(
+    `${META_MONITORING_PROMETHEUS_URL.replace(/\/$/, "")}/api/v1/query` +
+      `?query=${encodeURIComponent(SHEDDING_QUERY)}`,
+    { timeout: "5s" },
+  );
   if (RESPONSE.status !== 200) {
     const MESSAGE =
-      `failed to read Observatorium metrics: HTTP ${RESPONSE.status}: ${RESPONSE.body}`;
+      `failed to query meta-monitoring Prometheus: HTTP ${RESPONSE.status}: ${RESPONSE.body}`;
     console.error(
-      `run_id=${RUN_ID} event=observatorium-metrics-check-failed ` +
+      `run_id=${RUN_ID} event=meta-monitoring-query-failed ` +
         `utc=${new Date().toISOString()}`,
     );
     exec.test.abort(MESSAGE);
     throw new Error(MESSAGE);
   }
 
-  let total = 0;
-  for (const LINE of RESPONSE.body.split("\n")) {
-    if (
-      !LINE.startsWith("throttle_rejected_total") ||
-      !LINE.includes('handler="metrics"')
-    ) {
-      continue;
-    }
-    const MATCH = /^throttle_rejected_total(?:\{[^}]*\})?\s+([^\s]+)/.exec(LINE);
-    if (MATCH) {
-      total += Number(MATCH[1]);
-    }
+  let result;
+  try {
+    result = RESPONSE.json();
+  } catch (error) {
+    const MESSAGE = `failed to parse meta-monitoring Prometheus response: ${error}`;
+    exec.test.abort(MESSAGE);
+    throw new Error(MESSAGE);
+  }
+
+  const samples = result?.data?.result;
+  if (
+    result.status !== "success" ||
+    result?.data?.resultType !== "vector" ||
+    !Array.isArray(samples) ||
+    samples.length !== 1
+  ) {
+    const MESSAGE =
+      `unexpected meta-monitoring Prometheus response: ${RESPONSE.body}`;
+    exec.test.abort(MESSAGE);
+    throw new Error(MESSAGE);
+  }
+
+  const total = Number(samples[0].value?.[1]);
+  if (!Number.isFinite(total)) {
+    const MESSAGE =
+      `invalid throttle_rejected_total from meta-monitoring Prometheus: ${RESPONSE.body}`;
+    exec.test.abort(MESSAGE);
+    throw new Error(MESSAGE);
   }
   return total;
 }
