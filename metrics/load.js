@@ -12,8 +12,10 @@ const FINAL_STAGE_DURATION = __ENV.MAX_BURST_DURATION || "15m";
 const STAGE_DURATION_SECONDS = duration_seconds(STAGE_DURATION);
 const FINAL_STAGE_DURATION_SECONDS = duration_seconds(FINAL_STAGE_DURATION);
 
-// Time between stages when the next stage is gated by a check for load shedding.
-const STAGE_GATE_DELAY_SECONDS = Math.max(10, Number(__ENV.STAGE_GATE_DELAY_SECONDS || 120));
+// Time between stages. It must cover the preceding scenario's graceful-stop window 
+// so the two load-producing scenarios cannot write the same series concurrently.
+const SCENARIO_GRACEFUL_STOP = "30s";
+const STAGE_GATE_DELAY_SECONDS = validate_stage_gate_delay_seconds(Math.max(30, Number(__ENV.STAGE_GATE_DELAY_SECONDS || 120)));
 const SHEDDING_CHECK_INTERVAL = __ENV.SHEDDING_CHECK_INTERVAL || "5s";
 const AGENT_MAX_LAG_SECONDS = Math.max(0, Number(__ENV.AGENT_MAX_LAG_SECONDS || 5));
 
@@ -30,6 +32,10 @@ if (SAMPLES_PER_BATCH > 2500) {
 
 const PROMETHEUS_RECEIVER_URL = required(__ENV.PROMETHEUS_RECEIVER_URL, "PROMETHEUS_RECEIVER_URL");
 const PROMETHEUS_METRICS_URL = required(__ENV.PROMETHEUS_METRICS_URL, "PROMETHEUS_METRICS_URL");
+const OBSERVATORIUM_METRICS_URL = required(
+  __ENV.OBSERVATORIUM_METRICS_URL,
+  "OBSERVATORIUM_METRICS_URL",
+);
 const REMOTE_WRITE_NAME = __ENV.REMOTE_WRITE_NAME || "rhobs-load-test";
 const KUBE_API_SERVER_URL = required(__ENV.KUBE_API_SERVER_URL, "KUBE_API_SERVER_URL");
 const KUBE_NAMESPACE = required(__ENV.KUBE_NAMESPACE, "KUBE_NAMESPACE");
@@ -83,6 +89,7 @@ for (let stage_index = 0; stage_index < LOAD_STAGES.length; stage_index += 1) {
     timeUnit: "1s",
     duration: STAGE_DURATION,
     startTime: `${STAGE_START_SECONDS}s`,
+    gracefulStop: SCENARIO_GRACEFUL_STOP,
     preAllocatedVUs: Number(__ENV.PREALLOCATED_VUS || 100),
     maxVUs: Number(__ENV.MAX_VUS || 2000),
   };
@@ -108,7 +115,18 @@ for (let stage_index = 0; stage_index < LOAD_STAGES.length; stage_index += 1) {
   }
 }
 
-const UPDATE_START_SECONDS = next_stage_start_seconds;
+// Drain the Agent and let the last staged scenario's graceful-stop window
+// finish before starting the final hold and router restart.
+const FINAL_GATE_START_SECONDS = next_stage_start_seconds;
+scenarios.gate_final_stage = {
+  executor: "per-vu-iterations",
+  exec: "gate_next_stage",
+  vus: 1,
+  iterations: 1,
+  startTime: `${FINAL_GATE_START_SECONDS}s`,
+  maxDuration: `${STAGE_GATE_DELAY_SECONDS}s`,
+};
+const UPDATE_START_SECONDS = FINAL_GATE_START_SECONDS + STAGE_GATE_DELAY_SECONDS;
 const TOTAL_TEST_SECONDS = UPDATE_START_SECONDS + FINAL_STAGE_DURATION_SECONDS;
 
 // If shedding did not happen yet, keep the highest load level running while the Receive routers restart.
@@ -123,6 +141,7 @@ scenarios.final_stage_hold = {
   timeUnit: "1s",
   duration: FINAL_STAGE_DURATION,
   startTime: `${UPDATE_START_SECONDS}s`,
+  gracefulStop: SCENARIO_GRACEFUL_STOP,
   preAllocatedVUs: Number(__ENV.PREALLOCATED_VUS || 100),
   maxVUs: Number(__ENV.MAX_VUS || 2000),
 };
@@ -154,6 +173,7 @@ export const options = {
 export function setup() {
   const DEPLOYMENT = get_router_deployment();
   const AGENT_COUNTERS = get_agent_counters();
+  const THROTTLE_REJECTED = get_throttle_rejected_total();
 
   console.log(
     `run_id=${RUN_ID} event=setup utc=${new Date().toISOString()} ` +
@@ -162,6 +182,7 @@ export function setup() {
 
   return {
     agent_counters: AGENT_COUNTERS,
+    throttle_rejected: THROTTLE_REJECTED,
     router_replicas: DEPLOYMENT.spec.replicas,
   };
 }
@@ -237,7 +258,7 @@ export function send_batch() {
 }
 
 export function monitor_shedding(data) {
-  abort_if_shedding(data.agent_counters, "continuous-monitor");
+  abort_if_shedding(data.throttle_rejected, "continuous-monitor");
   sleep(duration_seconds(SHEDDING_CHECK_INTERVAL));
 }
 
@@ -246,16 +267,19 @@ export function gate_next_stage(data) {
   let current;
 
   while (Date.now() < DEADLINE) {
-    abort_if_shedding(data.agent_counters, exec.scenario.name);
+    abort_if_shedding(data.throttle_rejected, exec.scenario.name);
     current = get_agent_counters();
 
     if (
       current.pending_samples === 0 &&
       agent_lag_seconds(current) <= AGENT_MAX_LAG_SECONDS
     ) {
+      const next_stage = exec.scenario.name === "gate_final_stage"
+        ? "final_stage_hold"
+        : exec.scenario.name.replace("gate_load_stage_", "");
       console.log(
         `run_id=${RUN_ID} event=stage-gate-passed utc=${new Date().toISOString()} ` +
-          `next_stage=${exec.scenario.name.replace("gate_load_stage_", "")}`,
+          `next_stage=${next_stage}`,
       );
       return;
     }
@@ -271,7 +295,7 @@ export function gate_next_stage(data) {
 }
 
 export function restart_routers(data) {
-  abort_if_shedding(data.agent_counters, "pre-router-restart");
+  abort_if_shedding(data.throttle_rejected, "pre-router-restart");
 
   console.log(
     `run_id=${RUN_ID} event=router-restart-start utc=${new Date().toISOString()} ` +
@@ -285,13 +309,16 @@ export function restart_routers(data) {
   );
 }
 
-export function teardown() {
+export function teardown(data) {
   const AGENT = get_agent_counters();
   const ROUTER = get_router_deployment();
+  const THROTTLE_REJECTED = get_throttle_rejected_total();
   console.log(
     `run_id=${RUN_ID} event=teardown utc=${new Date().toISOString()} ` +
       `failed_samples=${AGENT.failed_samples} retried_samples=${AGENT.retried_samples} ` +
       `pending_samples=${AGENT.pending_samples} agent_lag_seconds=${agent_lag_seconds(AGENT)} ` +
+      `throttle_rejected_total=${THROTTLE_REJECTED} ` +
+      `throttle_rejected_delta=${THROTTLE_REJECTED - data.throttle_rejected} ` +
       `router_replicas=${ROUTER.spec.replicas} updated_replicas=${ROUTER.status?.updatedReplicas || 0} ` +
       `available_replicas=${ROUTER.status?.availableReplicas || 0} ` +
       `unavailable_replicas=${ROUTER.status?.unavailableReplicas || 0}`,
@@ -304,7 +331,9 @@ export function teardown() {
 //#region Utilities
 
 function abort_if_shedding(baseline, source) {
-  if (!check_shedding(baseline)) {
+
+  // Shedding is detected after 10 new rejected requests.
+  if (get_throttle_rejected_total() <= baseline + 10) {
     return;
   }
 
@@ -315,13 +344,33 @@ function abort_if_shedding(baseline, source) {
   exec.test.abort(MESSAGE);
 }
 
-// Failed/retried remote writes is a syntom for load shedding.
-function check_shedding(baseline) {
-  const CURRENT = get_agent_counters();
-  return (
-    CURRENT.failed_samples > baseline.failed_samples ||
-    CURRENT.retried_samples > baseline.retried_samples
-  );
+function get_throttle_rejected_total() {
+  const RESPONSE = http.get(OBSERVATORIUM_METRICS_URL, { timeout: "2s" });
+  if (RESPONSE.status !== 200) {
+    const MESSAGE =
+      `failed to read Observatorium metrics: HTTP ${RESPONSE.status}: ${RESPONSE.body}`;
+    console.error(
+      `run_id=${RUN_ID} event=observatorium-metrics-check-failed ` +
+        `utc=${new Date().toISOString()}`,
+    );
+    exec.test.abort(MESSAGE);
+    throw new Error(MESSAGE);
+  }
+
+  let total = 0;
+  for (const LINE of RESPONSE.body.split("\n")) {
+    if (
+      !LINE.startsWith("throttle_rejected_total") ||
+      !LINE.includes('handler="metrics"')
+    ) {
+      continue;
+    }
+    const MATCH = /^throttle_rejected_total(?:\{[^}]*\})?\s+([^\s]+)/.exec(LINE);
+    if (MATCH) {
+      total += Number(MATCH[1]);
+    }
+  }
+  return total;
 }
 
 function agent_lag_seconds(counters) {
@@ -330,7 +379,6 @@ function agent_lag_seconds(counters) {
 
 // Get Prometheus Agent RW metrics.
 function get_agent_counters() {
-  // Get with retries to avoid failures for unready Prometheus Agent.
   const RESPONSE = http.get(PROMETHEUS_METRICS_URL, { timeout: "2s" });
   if (RESPONSE.status !== 200) {
     const MESSAGE =
@@ -494,6 +542,15 @@ function duration_seconds(value) {
 function required(value, name) {
   if (!value) {
     throw new Error(`${name} is required`);
+  }
+  return value;
+}
+
+function validate_stage_gate_delay_seconds(value) {
+  if (!Number.isFinite(value) || value < duration_seconds(SCENARIO_GRACEFUL_STOP)) {
+    throw new Error(
+      `STAGE_GATE_DELAY_SECONDS must be at least ${duration_seconds(SCENARIO_GRACEFUL_STOP)}`,
+    );
   }
   return value;
 }
