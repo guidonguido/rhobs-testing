@@ -2,12 +2,14 @@ FROM registry.access.redhat.com/hi/go:1.27-builder as builder
 ARG XK6_VERSION=v1.4.13
 ARG K6_VERSION=v2.2.0
 ARG REMOTE_WRITE_EXTENSION_VERSION=v0.5.3
+ARG KUBERNETES_EXTENSION_VERSION=v0.12.0
 
 RUN dnf install -y git
 RUN mkdir -p /out && \
     go install go.k6.io/xk6@${XK6_VERSION} && \
     CGO_ENABLED=0 /go/bin/xk6 build \
       --with github.com/grafana/xk6-client-prometheus-remote@${REMOTE_WRITE_EXTENSION_VERSION} \
+      --with github.com/grafana/xk6-kubernetes@${KUBERNETES_EXTENSION_VERSION} \
       --output /out/k6
 
 FROM registry.access.redhat.com/hi/static:latest

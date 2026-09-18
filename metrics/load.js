@@ -1,6 +1,7 @@
 import { check, fail, sleep } from "k6";
 import http from "k6/http";
 import exec from "k6/execution";
+import { Kubernetes } from "k6/x/kubernetes";
 import remote from "k6/x/remotewrite";
 
 // Normal load the environment is expected to handle.
@@ -34,11 +35,15 @@ const PROMETHEUS_RECEIVER_URL = required(__ENV.PROMETHEUS_RECEIVER_URL, "PROMETH
 const PROMETHEUS_METRICS_URL = required(__ENV.PROMETHEUS_METRICS_URL, "PROMETHEUS_METRICS_URL");
 const META_MONITORING_PROMETHEUS_URL = required(__ENV.META_MONITORING_PROMETHEUS_URL, "META_MONITORING_PROMETHEUS_URL");
 const REMOTE_WRITE_NAME = __ENV.REMOTE_WRITE_NAME || "rhobs-load-test";
-const KUBE_API_SERVER_URL = required(__ENV.KUBE_API_SERVER_URL, "KUBE_API_SERVER_URL");
 const KUBE_NAMESPACE = required(__ENV.KUBE_NAMESPACE, "KUBE_NAMESPACE");
 const ROUTER_DEPLOYMENT_NAME = required(__ENV.ROUTER_DEPLOYMENT_NAME, "ROUTER_DEPLOYMENT_NAME");
-const SERVICE_ACCOUNT_TOKEN = open(required(
-  __ENV.SERVICE_ACCOUNT_TOKEN_FILE, "SERVICE_ACCOUNT_TOKEN_FILE"),).trim();
+
+// xk6-kubernetes default builder expect the SA token and CA mounted on the host
+// - /var/run/secrets/kubernetes.io/serviceaccount/token
+// - /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+function kubernetes_client() {
+  return new Kubernetes();
+}
 
 // Unique identifier for this load test run, used to annotate
 // the router deployment and identify generated metric samples.
@@ -298,8 +303,8 @@ export function restart_routers(data) {
     `run_id=${RUN_ID} event=router-restart-start utc=${new Date().toISOString()} ` +
       `deployment=${ROUTER_DEPLOYMENT_NAME} replicas=${data.router_replicas}`,
   );
-  rollout_restart_router_deployment();
-  wait_for_router_deployment(data.router_replicas);
+  const deleted_router_pods = delete_router_pods();
+  wait_for_router_deployment(data.router_replicas, deleted_router_pods);
   console.log(
     `run_id=${RUN_ID} event=router-restart-end utc=${new Date().toISOString()} ` +
       `deployment=${ROUTER_DEPLOYMENT_NAME} replicas=${data.router_replicas}`,
@@ -449,52 +454,57 @@ function metric_sum(metrics, metric_name) {
 }
 
 function get_router_deployment() {
-  const RESPONSE = http.get(deployment_url(), kube_request_params());
-  if (RESPONSE.status !== 200) {
-    fail(
-      `failed to get ${ROUTER_DEPLOYMENT_NAME}: HTTP ${RESPONSE.status}: ${RESPONSE.body}`,
-    );
-  }
-  return RESPONSE.json();
-}
-
-// Same PATCH produced by `kubectl rollout restart deployment/...`.
-function rollout_restart_router_deployment() {
-  const PATCH = {
-    spec: {
-      template: {
-        metadata: {
-          annotations: {
-            "kubectl.kubernetes.io/restartedAt": new Date().toISOString(),
-          },
-        },
-      },
-    },
-  };
-  const RESPONSE = http.patch(
-    deployment_url(),
-    JSON.stringify(PATCH),
-    kube_request_params("application/strategic-merge-patch+json"),
+  return kubernetes_client().get(
+    "Deployment.apps",
+    ROUTER_DEPLOYMENT_NAME,
+    KUBE_NAMESPACE,
   );
-  if (RESPONSE.status !== 200) {
-    fail(
-      `failed to restart ${ROUTER_DEPLOYMENT_NAME}: HTTP ${RESPONSE.status}: ${RESPONSE.body}`,
-    );
-  }
 }
 
-function wait_for_router_deployment(replicas) {
+function get_router_pods() {
+  return kubernetes_client()
+    .list("Pod", KUBE_NAMESPACE)
+    .filter((pod) =>
+      pod.metadata.labels?.["app.kubernetes.io/component"] === "thanos-receive-router",
+    );
+}
+
+// The Thanos Operator owns the Deployment Pod template and immediately
+// reconciles away a rollout-restart annotation. Deleting the Pods makes the
+// Deployment controller create replacements without changing operator-owned
+// configuration.
+function delete_router_pods() {
+  const CLIENT = kubernetes_client();
+  const PODS = CLIENT
+    .list("Pod", KUBE_NAMESPACE)
+    .filter((pod) =>
+      pod.metadata.labels?.["app.kubernetes.io/component"] === "thanos-receive-router",
+    );
+  if (PODS.length === 0) {
+    fail(`no thanos-receive-router Pods found in ${KUBE_NAMESPACE}`);
+  }
+  for (const POD of PODS) {
+    CLIENT.delete("Pod", POD.metadata.name, KUBE_NAMESPACE);
+  }
+  return PODS.map((pod) => pod.metadata.name);
+}
+
+function wait_for_router_deployment(replicas, deleted_router_pods) {
   const TIMEOUT_SECONDS = duration_seconds(__ENV.ROLLING_UPDATE_TIMEOUT || "10m");
   const DEADLINE = Date.now() + TIMEOUT_SECONDS * 1000;
 
   while (Date.now() < DEADLINE) {
     const DEPLOYMENT = get_router_deployment();
-    const STATUS = DEPLOYMENT.status || {};
+    const CURRENT_ROUTER_PODS = get_router_pods();
+    const REPLACED = CURRENT_ROUTER_PODS.length === replicas &&
+      CURRENT_ROUTER_PODS.every((pod) => !deleted_router_pods.includes(pod.metadata.name));
     if (
-      STATUS.observedGeneration >= DEPLOYMENT.metadata.generation &&
-      STATUS.updatedReplicas === replicas &&
-      STATUS.availableReplicas === replicas &&
-      (STATUS.unavailableReplicas || 0) === 0
+      REPLACED &&
+      DEPLOYMENT.status &&
+      DEPLOYMENT.status.observedGeneration >= DEPLOYMENT.metadata.generation &&
+      DEPLOYMENT.status.updatedReplicas === replicas &&
+      DEPLOYMENT.status.availableReplicas === replicas &&
+      (DEPLOYMENT.status.unavailableReplicas || 0) === 0
     ) {
       return;
     }
@@ -504,21 +514,6 @@ function wait_for_router_deployment(replicas) {
   fail(
     `timed out waiting for ${ROUTER_DEPLOYMENT_NAME} to have ${replicas} updated replicas`,
   );
-}
-
-function deployment_url() {
-  return (
-    `${KUBE_API_SERVER_URL}/apis/apps/v1/namespaces/${KUBE_NAMESPACE}` +
-    `/deployments/${ROUTER_DEPLOYMENT_NAME}`
-  );
-}
-
-function kube_request_params(content_type) {
-  const HEADERS = { Authorization: `Bearer ${SERVICE_ACCOUNT_TOKEN}` };
-  if (content_type) {
-    HEADERS["Content-Type"] = content_type;
-  }
-  return { headers: HEADERS, timeout: "30s" };
 }
 
 function stage_sample_rate(multiplier) {
