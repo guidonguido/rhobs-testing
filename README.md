@@ -6,13 +6,13 @@ Tests collection for validating RHOBS environment behavior. Tests are intended t
 
 | Path | Purpose |
 | --- | --- |
-| [`metrics/`](metrics/) | Drives Prometheus remote-write traffic with k6 and validates the load-shedding path while restarting a Receive router deployment. |
+| [`metrics/`](metrics/) | Generates controlled Prometheus remote-write traffic through a configured pool of Prometheus Agents. |
 
 ## Metrics load test
 
-[`metrics/load.js`](metrics/load.js) uses a [`k6`](https://github.com/grafana/xk6) binary built with the [`xk6-client-prometheus-remote`](https://github.com/grafana/xk6-client-prometheus-remote) and [`xk6-kubernetes`](https://github.com/grafana/xk6-kubernetes) extensions. It sends batches of the `rhobs_load_test_sample` metric, with a per-run `run_id` label and bounded synthetic cardinality labels.
+[`metrics/load.js`](metrics/load.js) uses a [`k6`](https://github.com/grafana/xk6) binary built with the [`xk6-client-prometheus-remote`](https://github.com/grafana/xk6-client-prometheus-remote) extension. It sends batches of the `rhobs_load_test_sample` metric, with a per-run `run_id` label and bounded synthetic cardinality labels.
 
-The test increases traffic through the configured `LOAD_STAGES`, waits for the Prometheus Agent's remote-write queue to drain between stages, and queries the configured meta-monitoring Prometheus for the fleet-wide `sum(throttle_rejected_total{job="rhobs-gateway", handler="metrics"})` counter. If that counter increases, the test aborts before scheduling more load. If no throttling is detected, it holds the highest rate and deletes the configured Receive router Pods, then waits for the Deployment controller to replace them.
+The workload generates remote-write traffic only, controlling the series cardinality and saples rate. A non-2xx response from an Agent aborts the k6 run immediately.
 
 ## License
 
